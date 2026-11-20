@@ -1,0 +1,9 @@
+{
+  "name": "稽核证据台 · 医保结算离线复核",
+  "short_name": "稽核证据台",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f2ec",
+  "theme_color": "#0e1c28",
+  "lang": "zh-CN"
+}

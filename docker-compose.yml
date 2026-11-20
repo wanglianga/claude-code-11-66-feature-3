@@ -1,0 +1,8 @@
+services:
+  audit-desk:
+    build: .
+    image: medaudit-evidence-desk:1.0.0
+    container_name: medaudit-evidence-desk
+    ports:
+      - "8080:80"
+    restart: unless-stopped
