@@ -1,5 +1,6 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 import type { AuditEvent, BatchRecord, Dataset, MaterialPackage } from '../types/domain';
+import type { StatsRun, StatsState } from '../types/stats';
 
 interface AuditDB extends DBSchema {
   datasets: {
@@ -24,10 +25,19 @@ interface AuditDB extends DBSchema {
     key: string;
     value: { key: string; value: string };
   };
+  stats: {
+    key: string;
+    value: { key: string; value: StatsState };
+  };
+  statsRuns: {
+    key: string;
+    value: StatsRun;
+    indexes: { 'by-createdAt': string };
+  };
 }
 
 const DB_NAME = 'medaudit-evidence-desk';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 let dbPromise: Promise<IDBPDatabase<AuditDB>> | null = null;
 
@@ -35,13 +45,31 @@ export function getDB(): Promise<IDBPDatabase<AuditDB>> {
   if (!dbPromise) {
     dbPromise = openDB<AuditDB>(DB_NAME, DB_VERSION, {
       upgrade(db) {
-        db.createObjectStore('datasets', { keyPath: 'meta.datasetId' });
-        const materials = db.createObjectStore('materials', { keyPath: 'id' });
-        materials.createIndex('by-createdAt', 'createdAt');
-        const events = db.createObjectStore('events', { keyPath: 'id' });
-        events.createIndex('by-at', 'at');
-        db.createObjectStore('batches', { keyPath: 'id' });
-        db.createObjectStore('meta', { keyPath: 'key' });
+        if (!db.objectStoreNames.contains('datasets')) {
+          db.createObjectStore('datasets', { keyPath: 'meta.datasetId' });
+        }
+        if (!db.objectStoreNames.contains('materials')) {
+          const materials = db.createObjectStore('materials', { keyPath: 'id' });
+          materials.createIndex('by-createdAt', 'createdAt');
+        }
+        if (!db.objectStoreNames.contains('events')) {
+          const events = db.createObjectStore('events', { keyPath: 'id' });
+          events.createIndex('by-at', 'at');
+        }
+        if (!db.objectStoreNames.contains('batches')) {
+          db.createObjectStore('batches', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('meta')) {
+          db.createObjectStore('meta', { keyPath: 'key' });
+        }
+        // v2：医保服务项目代码沿革与历史可比统计
+        if (!db.objectStoreNames.contains('stats')) {
+          db.createObjectStore('stats', { keyPath: 'key' });
+        }
+        if (!db.objectStoreNames.contains('statsRuns')) {
+          const statsRuns = db.createObjectStore('statsRuns', { keyPath: 'id' });
+          statsRuns.createIndex('by-createdAt', 'createdAt');
+        }
       },
       blocked() {
         console.warn('IndexedDB 升级被其他标签页阻塞');
@@ -106,15 +134,55 @@ export async function setMeta(key: string, value: string): Promise<void> {
   await db.put('meta', { key, value });
 }
 
+// ---------------------------------------------------------------------------
+// 代码沿革与可比统计模块
+// ---------------------------------------------------------------------------
+
+const STATS_KEY = 'current';
+
+export async function loadStatsState(): Promise<StatsState | null> {
+  const db = await getDB();
+  const entry = await db.get('stats', STATS_KEY);
+  return entry?.value ?? null;
+}
+
+export async function saveStatsState(state: StatsState): Promise<void> {
+  const db = await getDB();
+  const tx = db.transaction(['stats', 'batches'], 'readwrite');
+  await tx.objectStore('stats').put({ key: STATS_KEY, value: state });
+  for (const batch of state.batches) {
+    await tx.objectStore('batches').put(batch);
+  }
+  await tx.done;
+}
+
+export async function listStatsRuns(): Promise<StatsRun[]> {
+  const db = await getDB();
+  const runs = await db.getAll('statsRuns');
+  return runs.sort((a, b) => a.version - b.version);
+}
+
+export async function saveStatsRun(run: StatsRun): Promise<void> {
+  const db = await getDB();
+  await db.put('statsRuns', run);
+}
+
+export async function clearStatsRuns(): Promise<void> {
+  const db = await getDB();
+  await db.clear('statsRuns');
+}
+
 export async function resetAll(): Promise<void> {
   const db = await getDB();
-  const tx = db.transaction(['datasets', 'materials', 'events', 'batches', 'meta'], 'readwrite');
+  const tx = db.transaction(['datasets', 'materials', 'events', 'batches', 'meta', 'stats', 'statsRuns'], 'readwrite');
   await Promise.all([
     tx.objectStore('datasets').clear(),
     tx.objectStore('materials').clear(),
     tx.objectStore('events').clear(),
     tx.objectStore('batches').clear(),
     tx.objectStore('meta').clear(),
+    tx.objectStore('stats').clear(),
+    tx.objectStore('statsRuns').clear(),
   ]);
   await tx.done;
 }

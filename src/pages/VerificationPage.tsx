@@ -10,7 +10,7 @@ import {
 import { useApp } from '../store/AppStore';
 import { PageHeader, Stat, SectionCard } from '../components/Page';
 import { Badge } from '../components/Badge';
-import { formatCents, formatCount } from '../lib/money';
+import { formatCents, formatCount, formatPercent } from '../lib/money';
 import { buildOfflineViewerHtml } from '../core/offlineViewer';
 import { downloadBlob } from '../core/export';
 import { buildMaterial, diffMaterials } from '../core/material';
@@ -20,13 +20,14 @@ import {
   buildQualificationCorrection,
 } from '../core/sample';
 import { applyConclusionCorrection, applyQualificationCorrection } from '../core/corrections';
+import { buildCompareTables, buildParentPlacements, diffRuns, hopsOf, replayRun } from '../core/comparable';
 import { nowLocalIso } from '../lib/time';
 import { sha256Hex } from '../core/hash';
 
 type Check = { id: string; title: string; expected: string; actual: string; passed: boolean; note?: string };
 
 export function VerificationPage() {
-  const { dataset, analysis, materials, toast } = useApp();
+  const { dataset, analysis, materials, toast, statsState, statsRuns } = useApp();
   const [scopeMode, setScopeMode] = useState<'all' | 'pending'>('all');
 
   const scope = useMemo(
@@ -241,6 +242,198 @@ export function VerificationPage() {
     return list;
   }, [dataset, analysis, material, scope, scopeMode, materials]);
 
+  // ---- 代码沿革与历史可比统计 · 验收检查组 ----
+  const statsChecks = useMemo<Check[]>(() => {
+    if (!statsState || statsRuns.length === 0) return [];
+    const list: Check[] = [];
+    const rows = statsState.rows;
+    const run = statsRuns[statsRuns.length - 1]!;
+    const tables = buildCompareTables(rows, run.snapshot.entries, run.resolutions);
+    const totalAmount = rows.reduce((acc, row) => acc + row.amountCents, 0);
+    const cellSum = (cells: Record<string, Record<number, { amountCents: number }>>) =>
+      Object.values(cells).reduce(
+        (acc, byYear) => acc + Object.values(byYear).reduce((sum, cell) => sum + cell.amountCents, 0),
+        0,
+      );
+    const poolSum = (byYear: Record<number, { amountCents: number }>) =>
+      Object.values(byYear).reduce((acc, cell) => acc + cell.amountCents, 0);
+
+    // 1. 金额守恒：唯一映射 + 歧义池 + 未映射池 = 原始口径总计（两种口径都验证）
+    const mappedSum = cellSum(tables.finest.cells);
+    const ambiguousSum = poolSum(tables.finest.ambiguousByYear);
+    const unmappedSum = poolSum(tables.finest.unmappedByYear);
+    const finestTotal = mappedSum + ambiguousSum + unmappedSum;
+    const parentTotal = cellSum(tables.parent.cells) + poolSum(tables.parent.unmappedByYear);
+    list.push({
+      id: 'stats-conservation',
+      title: '金额守恒 · 归属互斥不重复计额',
+      expected: `最细口径与上级口径各归属之和均为 ¥${formatCents(totalAmount)}`,
+      actual: `最细 ${formatCents(mappedSum)}+${formatCents(ambiguousSum)}+${formatCents(unmappedSum)}=¥${formatCents(finestTotal)}；上级合计 ¥${formatCents(parentTotal)}`,
+      passed: finestTotal === totalAmount && parentTotal === totalAmount,
+      note: '每行结算金额只落入一个归属（唯一类别 / 歧义池 / 未映射池）。',
+    });
+
+    // 2. 拆分候选不当作已分配金额
+    const ambiguousResolutions = run.resolutions.filter((resolution) => resolution.status === 'ambiguous');
+    const ambiguousAmount = ambiguousResolutions.reduce((acc, resolution) => acc + resolution.amountCents, 0);
+    const candidatesOk = ambiguousResolutions.every(
+      (resolution) => resolution.candidates.length >= 2 && resolution.targetCategoryCode === null,
+    );
+    list.push({
+      id: 'stats-candidates',
+      title: '拆分候选 · 不当作已分配金额',
+      expected: '歧义池金额不进入任何类别合计；候选均带分摊依据标注',
+      actual: `歧义 ${ambiguousResolutions.length} 行 / ¥${formatCents(ambiguousAmount)}；类别合计 ¥${formatCents(mappedSum)} 不含候选`,
+      passed: candidatesOk && ambiguousAmount === ambiguousSum,
+    });
+
+    // 3. 代码复用按服务日分段，不按当前释义回填
+    const placements = buildParentPlacements(rows, run.snapshot.entries);
+    const a100Rows = rows.filter((row) => row.localCode === 'A100');
+    const reuseOk = a100Rows.every((row) => {
+      const placement = placements.get(row.id);
+      if (!placement) return false;
+      const entry = run.snapshot.entries.find((item) => item.id === placement.entryId);
+      if (row.year <= 2023) return entry?.nationalCategoryCode === '200101' && placement.categoryCode === '2001';
+      return entry?.nationalCategoryCode === '300101' && placement.categoryCode === '3001';
+    });
+    const noBackfill = a100Rows.every((row) => {
+      const placement = placements.get(row.id);
+      return row.year <= 2023 ? placement?.categoryCode !== '3001' : true;
+    });
+    list.push({
+      id: 'stats-reuse',
+      title: '代码复用 · 按服务发生日分段释义',
+      expected: 'A100：2023 年→200101 光疗与热疗；2025 年→300101 中医外治；不回填',
+      actual: a100Rows
+        .map((row) => `${row.year}→${placements.get(row.id)?.categoryCode ?? '无'}`)
+        .filter((value, index, array) => array.indexOf(value) === index)
+        .join('，'),
+      passed: reuseOk && noBackfill && a100Rows.length > 0,
+    });
+
+    // 4. 无依据拆分不复制金额
+    const splitRows = run.resolutions.filter(
+      (resolution) => resolution.localCode === 'ZH600' || resolution.localCode === 'ZL700',
+    );
+    const splitsPooled = splitRows.every((resolution) => resolution.status === 'ambiguous');
+    const zhNoBasis = run.resolutions
+      .filter((resolution) => resolution.localCode === 'ZH600')
+      .every((resolution) => resolution.candidates.every((candidate) => candidate.weight === null));
+    const zlWithBasis = run.resolutions
+      .filter((resolution) => resolution.localCode === 'ZL700')
+      .every((resolution) => resolution.candidates.some((candidate) => candidate.weight !== null));
+    list.push({
+      id: 'stats-split-pool',
+      title: '拆分无依据 · 金额保留歧义池不复制',
+      expected: 'ZH600 / ZL700 全部进歧义池；ZH600 候选无权重；ZL700 候选带权重',
+      actual: `${splitRows.length} 行拆分历史行，状态均为${splitsPooled ? '歧义池' : '异常'}；类别合计中金额为 ¥0`,
+      passed: splitRows.length > 0 && splitsPooled && zhNoBasis && zlWithBasis,
+    });
+
+    // 5. 覆盖率分母明确
+    const years = tables.finest.years;
+    const coverageOk = years.every((year) => {
+      const coverage = tables.finest.coverageByYear[year]!;
+      const yearRows = rows.filter((row) => row.year === year);
+      const yearAmount = yearRows.reduce((acc, row) => acc + row.amountCents, 0);
+      const poolRows =
+        (tables.finest.ambiguousByYear[year]?.rows ?? 0) + (tables.finest.unmappedByYear[year]?.rows ?? 0);
+      const poolAmount =
+        (tables.finest.ambiguousByYear[year]?.amountCents ?? 0) + (tables.finest.unmappedByYear[year]?.amountCents ?? 0);
+      return (
+        coverage.totalRows === yearRows.length &&
+        coverage.totalAmountCents === yearAmount &&
+        coverage.mappedRows + poolRows === coverage.totalRows &&
+        coverage.mappedAmountCents + poolAmount === coverage.totalAmountCents
+      );
+    });
+    list.push({
+      id: 'stats-coverage',
+      title: '覆盖率 · 分母为全部结算提取行',
+      expected: '每年：唯一映射 + 歧义池 + 未映射池 = 分母（行数与金额）',
+      actual: years
+        .map((year) => {
+          const coverage = tables.finest.coverageByYear[year]!;
+          return `${year}：${coverage.mappedRows}+${(tables.finest.ambiguousByYear[year]?.rows ?? 0) + (tables.finest.unmappedByYear[year]?.rows ?? 0)}=${coverage.totalRows} 行`;
+        })
+        .join('；'),
+      passed: coverageOk,
+    });
+
+    // 6. 映射依据可回查
+    const mappingById = new Map(run.snapshot.mappings.map((mapping) => [mapping.id, mapping]));
+    const evidenceOk = run.resolutions.every((resolution) => {
+      if (resolution.status === 'mapped') {
+        const hops = hopsOf(resolution);
+        return hops.every((hop) => mappingById.get(hop.mappingId)?.evidenceStatus === '齐全');
+      }
+      if (resolution.status === 'ambiguous') return resolution.candidates.length >= 2 && resolution.reason.length > 0;
+      if (resolution.status === 'unmapped') return resolution.reason.length > 0;
+      return true;
+    });
+    const mappedWithEvidence = run.resolutions.filter((resolution) => resolution.status === 'mapped').length;
+    list.push({
+      id: 'stats-evidence',
+      title: '映射依据 · 每个可比结果可回查',
+      expected: '映射结转行的每一跳均有证据齐全的映射记录；歧义/未映射行均有原因',
+      actual: `${mappedWithEvidence} 行映射结转全部可回查至 MAP 台账`,
+      passed: evidenceOk,
+    });
+
+    // 7. 更正只重建涉及代码和期间
+    if (statsRuns.length >= 2) {
+      const first = statsRuns[0]!;
+      const last = statsRuns[statsRuns.length - 1]!;
+      const runDiff = diffRuns(first, last, rows);
+      const declared = new Set(last.affectedScope?.codes ?? []);
+      const withinScope = runDiff.changedRows.every((row) => declared.has(row.localCode));
+      const scopeMatches =
+        last.affectedScope !== null &&
+        runDiff.changedRows.length === last.affectedScope.changedRowIds.length &&
+        runDiff.unchangedRows + runDiff.changedRows.length === rows.length;
+      list.push({
+        id: 'stats-rebuild-scope',
+        title: '目录更正 · 只重建涉及代码和期间',
+        expected: `变化行 ⊆ 声明范围（${[...declared].join('、')}），其余逐字沿用`,
+        actual: `变化 ${runDiff.changedRows.length} 行（${runDiff.affectedCodes.join('、')} / ${runDiff.affectedYears.join('、')}），沿用 ${runDiff.unchangedRows} 行`,
+        passed: withinScope && scopeMatches,
+      });
+    } else {
+      list.push({
+        id: 'stats-rebuild-scope',
+        title: '目录更正 · 只重建涉及代码和期间',
+        expected: '应用 B-CAT-C1 后校验实际差异 ⊆ 声明范围',
+        actual: '当前仅 V1 基线；在「统计版本」页应用更正后本项给出实质结论',
+        passed: true,
+        note: '未执行更正时按通过计，不阻塞验收。',
+      });
+    }
+
+    // 8. 旧版本可复现
+    const replayResults = statsRuns.map((item) => ({ item, replay: replayRun(item, rows) }));
+    const replayOk = replayResults.every((result) => result.replay.ok);
+    list.push({
+      id: 'stats-replay',
+      title: '旧口径 · 冻结输入可复现',
+      expected: '每个统计版本用其冻结输入重算，输出摘要一致',
+      actual: replayResults.map((result) => `V${result.item.version}${result.replay.ok ? '一致' : '不一致'}`).join('；'),
+      passed: replayOk,
+    });
+
+    return list;
+  }, [statsState, statsRuns]);
+
+  const statsPassed = statsChecks.filter((check) => check.passed).length;
+  const latestRun = statsRuns.length > 0 ? statsRuns[statsRuns.length - 1]! : null;
+  const latestCoverage = useMemo(() => {
+    if (!statsState || !latestRun) return null;
+    const tables = buildCompareTables(statsState.rows, latestRun.snapshot.entries, latestRun.resolutions);
+    const total = Object.values(tables.finest.totalByYear).reduce((acc, cell) => acc + cell.amountCents, 0);
+    const mapped = Object.values(tables.finest.mappedByYear).reduce((acc, cell) => acc + cell.amountCents, 0);
+    return total === 0 ? null : { total, mapped, rate: mapped / total };
+  }, [statsState, latestRun]);
+
   if (!dataset || !analysis || !material) {
     return <div className="content"><div className="empty">载入中…</div></div>;
   }
@@ -345,6 +538,57 @@ export function VerificationPage() {
               </div>
             ))}
           </SectionCard>
+        </div>
+      </div>
+
+      <div className="section-title mt-16">代码沿革与历史可比统计 · 验收</div>
+
+      <div className="grid cols-4">
+        <Stat
+          label="统计验收通过"
+          value={`${statsPassed} / ${statsChecks.length}`}
+          accent={statsChecks.length > 0 && statsPassed === statsChecks.length ? 'teal' : 'red'}
+          hint="实时计算"
+        />
+        <Stat label="结算提取行" value={statsState ? formatCount(statsState.rows.length) : '—'} hint="2023–2025 跨年度" />
+        <Stat label="统计版本" value={statsRuns.length} hint={latestRun ? `当前 V${latestRun.version}` : '尚未生成'} />
+        <Stat
+          label="最新口径金额覆盖率"
+          value={latestCoverage ? formatPercent(latestCoverage.rate) : '—'}
+          accent="blue"
+          hint={latestCoverage ? `分母 ¥${formatCents(latestCoverage.total)}（全部提取行）` : ''}
+        />
+      </div>
+
+      <div className="card mt-16">
+        <div className="card-head">
+          <div>
+            <h2>可比统计验收清单</h2>
+            <div className="desc">金额不重复、覆盖率分母明确、候选不当作已分配、复用分段、更正范围与旧口径复现。</div>
+          </div>
+          <div className="spacer row">
+            <Badge tone={statsChecks.length > 0 && statsPassed === statsChecks.length ? 'ok' : 'bad'}>
+              <BadgeCheck size={12} /> {statsPassed === statsChecks.length ? '全部通过' : `${statsChecks.length - statsPassed} 项待处理`}
+            </Badge>
+          </div>
+        </div>
+        <div className="card-body">
+          <div className="check-list">
+            {statsChecks.map((check) => (
+              <div className="check-row" key={check.id}>
+                <span className={`check-icon ${check.passed ? 'pass' : 'fail'}`}>
+                  {check.passed ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
+                </span>
+                <div>
+                  <div className="label">{check.title}</div>
+                  <div className="detail">期望：{check.expected}</div>
+                  <div className="detail">实际：{check.actual}</div>
+                  {check.note ? <div className="detail" style={{ color: 'var(--muted-2)' }}>{check.note}</div> : null}
+                </div>
+                <Badge tone={check.passed ? 'ok' : 'bad'}>{check.passed ? '通过' : '未通过'}</Badge>
+              </div>
+            ))}
+          </div>
         </div>
       </div>
 

@@ -15,6 +15,8 @@ export type BatchRole =
   | '处理结论'
   | '字段字典'
   | '规则目录'
+  | '目录版本'
+  | '映射批次'
   | '更正批次';
 
 export type ConclusionCode = '合规' | '违规' | '待核' | '整改';

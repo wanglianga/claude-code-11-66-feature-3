@@ -8,17 +8,25 @@ import type {
   MaterialPackage,
   ScopeFilter,
 } from '../types/domain';
+import type { StatsRun, StatsState } from '../types/stats';
 import { analyzeDataset, filterRows, scopeFingerprint } from '../core/analysis';
 import { DEFAULT_CONFIG } from '../core/sample';
+import { applyCatalogCorrection, buildCatalogCorrection, buildStatsState, CORRECTION_BATCH_ID } from '../core/catalog';
+import { buildStatsRun, rebuildStatsRun } from '../core/comparable';
 import { auditWorker } from '../worker/client';
 import {
+  clearStatsRuns,
   listEvents,
   listMaterials,
+  listStatsRuns,
   loadCurrentDataset,
+  loadStatsState,
   resetAll,
   saveDataset,
   saveEvent,
   saveMaterial,
+  saveStatsRun,
+  saveStatsState,
   setMeta,
 } from '../db/idb';
 
@@ -42,6 +50,13 @@ interface AppStore {
   toast: (message: string, tone?: 'info' | 'warn') => void;
   reset: () => Promise<void>;
   refreshMaterials: () => Promise<void>;
+  // 代码沿革与历史可比统计
+  statsState: StatsState | null;
+  statsRuns: StatsRun[];
+  activeRunId: string | null;
+  setActiveRun: (id: string) => void;
+  applyStatsCorrection: () => Promise<void>;
+  resetStats: () => Promise<void>;
 }
 
 const AppContext = createContext<AppStore | null>(null);
@@ -71,6 +86,21 @@ const INITIAL_SCOPE: ScopeFilter = {
   onlyPending: false,
 };
 
+function buildInitialStatsRun(state: StatsState, createdAt: string): StatsRun {
+  return buildStatsRun({
+    version: 1,
+    rows: state.rows,
+    entries: state.entries,
+    mappings: state.mappings,
+    createdAt,
+    label: '统计运行 V1（基线口径）',
+    supersedesRunId: null,
+    correctionNote: null,
+    affectedScope: null,
+    carriedOverRows: 0,
+  });
+}
+
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);
   const [dataset, setDataset] = useState<Dataset | null>(null);
@@ -80,6 +110,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [scope, setScope] = useState<ScopeFilter>(INITIAL_SCOPE);
+  const [statsState, setStatsState] = useState<StatsState | null>(null);
+  const [statsRuns, setStatsRuns] = useState<StatsRun[]>([]);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const toastId = useRef(0);
 
   const toast = useCallback((message: string, tone: 'info' | 'warn' = 'info') => {
@@ -102,8 +135,34 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setMaterials(list);
   }, []);
 
+  /** 载入或播种统计模块（目录 + 映射 + 结算提取 + 基线运行 V1）。 */
+  const ensureStats = useCallback(async (): Promise<{ state: StatsState; runs: StatsRun[] }> => {
+    const storedState = await loadStatsState();
+    const storedRuns = await listStatsRuns();
+    if (storedState && storedRuns.length > 0) {
+      setStatsState(storedState);
+      setStatsRuns(storedRuns);
+      setActiveRunId(storedRuns[storedRuns.length - 1]!.id);
+      return { state: storedState, runs: storedRuns };
+    }
+    const seeded = buildStatsState();
+    const run = buildInitialStatsRun(seeded, nowIso());
+    await saveStatsState(seeded);
+    await saveStatsRun(run);
+    setStatsState(seeded);
+    setStatsRuns([run]);
+    setActiveRunId(run.id);
+    await pushEvent({
+      kind: '初始化',
+      title: '初始化代码沿革统计样例',
+      detail: `目录 ${seeded.catalogs.length} 版、映射 ${seeded.mappings.length} 条、跨年度结算提取 ${seeded.rows.length} 行；生成统计运行 V1 基线。`,
+    });
+    return { state: seeded, runs: [run] };
+  }, [pushEvent]);
+
   const bootstrap = useCallback(async () => {
     try {
+      await ensureStats();
       const stored = await loadCurrentDataset();
       const storedMaterials = await listMaterials();
       const storedEvents = await listEvents();
@@ -132,7 +191,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setReady(true);
     }
-  }, [pushEvent, toast]);
+  }, [ensureStats, pushEvent, toast]);
 
   useEffect(() => {
     void bootstrap();
@@ -150,10 +209,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         setMaterials([]);
         setEvents([]);
         setScope(INITIAL_SCOPE);
+        // resetAll 同时清空了统计模块存储，重新播种基线。
+        const seededStats = buildStatsState();
+        const statsRun = buildInitialStatsRun(seededStats, nowIso());
+        await saveStatsState(seededStats);
+        await saveStatsRun(statsRun);
+        setStatsState(seededStats);
+        setStatsRuns([statsRun]);
+        setActiveRunId(statsRun.id);
         await pushEvent({
           kind: '导入',
           title: '重新生成样例批次',
-          detail: `随机种子 ${config.seed}，结算行 ${result.dataset.settlements.length} 条，规则命中 ${result.dataset.hits.length} 条；已清空旧材料。`,
+          detail: `随机种子 ${config.seed}，结算行 ${result.dataset.settlements.length} 条，规则命中 ${result.dataset.hits.length} 条；已清空旧材料，统计模块同步重置为基线。`,
         });
         toast(`已生成 ${result.dataset.settlements.length} 条结算行`);
       } catch (error) {
@@ -186,6 +253,70 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     [pushEvent, refreshMaterials],
   );
 
+  const applyStatsCorrection = useCallback(async () => {
+    if (!statsState || statsRuns.length === 0) return;
+    if (statsState.correctionsApplied.includes(CORRECTION_BATCH_ID)) {
+      toast(`更正批次 ${CORRECTION_BATCH_ID} 已应用，不重复执行`, 'warn');
+      return;
+    }
+    setBusy('正在应用目录更正并重建统计版本…');
+    try {
+      const correction = buildCatalogCorrection(statsState);
+      const nextState = applyCatalogCorrection(statsState, correction);
+      const prevRun = statsRuns[statsRuns.length - 1]!;
+      const { run, changedRowIds } = rebuildStatsRun({
+        prev: prevRun,
+        rows: nextState.rows,
+        entries: nextState.entries,
+        mappings: nextState.mappings,
+        declaredCodes: correction.affectedCodes,
+        createdAt: nowIso(),
+        correctionNote: correction.note,
+      });
+      await saveStatsState(nextState);
+      await saveStatsRun(run);
+      setStatsState(nextState);
+      setStatsRuns((prev) => [...prev, run]);
+      setActiveRunId(run.id);
+      await pushEvent({
+        kind: '更正',
+        title: `应用目录更正 ${correction.batch.id}，生成统计运行 V${run.version}`,
+        detail: `${correction.note} 实际重算 ${changedRowIds.length} 行（声明涉及代码 ${correction.affectedCodes.join('、')}），其余 ${run.carriedOverRows} 行逐字沿用 V${prevRun.version}；旧版本仍可复现。`,
+      });
+      toast(`已生成统计运行 V${run.version}：${changedRowIds.length} 行重算，${run.carriedOverRows} 行沿用`);
+    } catch (error) {
+      toast(`目录更正失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
+    } finally {
+      setBusy(null);
+    }
+  }, [statsState, statsRuns, pushEvent, toast]);
+
+  const resetStats = useCallback(async () => {
+    setBusy('正在恢复统计模块默认样例…');
+    try {
+      const seeded = buildStatsState();
+      const run = buildInitialStatsRun(seeded, nowIso());
+      await saveStatsState(seeded);
+      await clearStatsRuns();
+      await saveStatsRun(run);
+      setStatsState(seeded);
+      setStatsRuns([run]);
+      setActiveRunId(run.id);
+      await pushEvent({
+        kind: '初始化',
+        title: '恢复统计模块默认样例',
+        detail: '目录、映射与结算提取恢复为内置样例；统计运行回到 V1 基线，已应用的目录更正在被撤销。',
+      });
+      toast('统计模块已恢复默认样例');
+    } finally {
+      setBusy(null);
+    }
+  }, [pushEvent, toast]);
+
+  const setActiveRun = useCallback((id: string) => {
+    setActiveRunId(id);
+  }, []);
+
   const reset = useCallback(async () => {
     await resetAll();
     setMaterials([]);
@@ -193,11 +324,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setDataset(null);
     setAnalysis(null);
     setScope(INITIAL_SCOPE);
+    const seededStats = buildStatsState();
+    const statsRun = buildInitialStatsRun(seededStats, nowIso());
+    await saveStatsState(seededStats);
+    await saveStatsRun(statsRun);
+    setStatsState(seededStats);
+    setStatsRuns([statsRun]);
+    setActiveRunId(statsRun.id);
     const seeded = await auditWorker.generate(DEFAULT_CONFIG);
     setDataset(seeded.dataset);
     setAnalysis(seeded.analysis);
     await saveDataset(seeded.dataset);
-    await pushEvent({ kind: '初始化', title: '重置工作区', detail: '清空材料与事件，重新载入样例批次。' });
+    await pushEvent({ kind: '初始化', title: '重置工作区', detail: '清空材料与事件，重新载入样例批次；统计模块同步恢复基线。' });
     toast('工作区已重置');
   }, [pushEvent, toast]);
 
@@ -224,6 +362,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     toast,
     reset,
     refreshMaterials,
+    statsState,
+    statsRuns,
+    activeRunId,
+    setActiveRun,
+    applyStatsCorrection,
+    resetStats,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

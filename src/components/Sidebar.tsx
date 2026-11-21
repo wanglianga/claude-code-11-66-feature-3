@@ -8,6 +8,10 @@ import {
   GitCompareArrows,
   Database,
   ListChecks,
+  BookOpen,
+  GitFork,
+  BarChart3,
+  Layers,
 } from 'lucide-react';
 import { useApp } from '../store/AppStore';
 import { formatCount } from '../lib/money';
@@ -16,6 +20,12 @@ const WORK_NAV = [
   { to: '/', label: '工作台总览', icon: LayoutDashboard, end: true },
   { to: '/ledger', label: '稽核明细', icon: Rows3 },
   { to: '/scope', label: '范围冻结', icon: FolderSearch },
+];
+const STATS_NAV = [
+  { to: '/catalog', label: '目录沿革', icon: BookOpen },
+  { to: '/mappings', label: '映射关系', icon: GitFork },
+  { to: '/compare', label: '可比统计', icon: BarChart3 },
+  { to: '/runs', label: '统计版本', icon: Layers },
 ];
 const TRACE_NAV = [
   { to: '/materials', label: '证据材料', icon: PackageCheck },
@@ -52,6 +62,17 @@ export function Sidebar() {
             <span>{item.label}</span>
             {item.to === '/ledger' && analysis ? <span className="count">{formatCount(rowTotal)}</span> : null}
             {item.to === '/scope' && scopeFiltered ? <span className="count">{formatCount(scopeRows.length)}</span> : null}
+          </NavLink>
+        ))}
+        <div className="nav-label">政策统计</div>
+        {STATS_NAV.map((item) => (
+          <NavLink
+            key={item.to}
+            to={item.to}
+            className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
+          >
+            <item.icon size={16} className="icon" />
+            <span>{item.label}</span>
           </NavLink>
         ))}
         <div className="nav-label">材料与追溯</div>

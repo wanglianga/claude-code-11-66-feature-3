@@ -9,6 +9,10 @@ import { DiffPage } from './pages/DiffPage';
 import { BatchesPage } from './pages/BatchesPage';
 import { TimelinePage } from './pages/TimelinePage';
 import { VerificationPage } from './pages/VerificationPage';
+import { CatalogPage } from './pages/CatalogPage';
+import { MappingsPage } from './pages/MappingsPage';
+import { ComparePage } from './pages/ComparePage';
+import { RunsPage } from './pages/RunsPage';
 import { Filter } from 'lucide-react';
 
 function Toasts() {
@@ -61,6 +65,10 @@ function Shell() {
               <Route path="/diff" element={<DiffPage />} />
               <Route path="/batches" element={<BatchesPage />} />
               <Route path="/timeline" element={<TimelinePage />} />
+              <Route path="/catalog" element={<CatalogPage />} />
+              <Route path="/mappings" element={<MappingsPage />} />
+              <Route path="/compare" element={<ComparePage />} />
+              <Route path="/runs" element={<RunsPage />} />
               <Route path="/verification" element={<VerificationPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
